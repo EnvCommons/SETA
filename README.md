@@ -4,7 +4,7 @@
 
 ## Description
 
-SETA (Synthetic Environment for Terminal Agents) is an environment for evaluating terminal-based coding and system administration capabilities. It contains 400 tasks covering software engineering (309 tasks), system administration (79 tasks), and DevOps/security/networking (12 tasks). Each task is validated by a pytest test suite with weighted scoring.
+SETA (Scaling Environments for Terminal Agents) is an environment for evaluating terminal-based coding and system administration capabilities, developed by [CAMEL-AI](https://github.com/camel-ai/seta). It contains 400 tasks covering software engineering (309 tasks), system administration (79 tasks), and DevOps/security/networking (12 tasks). Each task is validated by a pytest test suite with weighted scoring.
 
 ## Capabilities
 
@@ -19,7 +19,7 @@ Agents are given a sandboxed environment with CLI tools (bash, read, write, edit
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT).
+[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 ## Tasks
 
@@ -69,10 +69,12 @@ Agents in SETA operate within sandboxed environments. Commands are executed in i
 ## Citation
 
 ```bibtex
-@misc{seta2025,
-  title={SETA: Synthetic Environment for Terminal Agents},
-  author={CAMEL-AI.org},
-  year={2025},
-  url={https://github.com/camel-ai/seta-env}
+@misc{seta,
+  author    = {Qijia Shen and Jay Rainton and Aznaur Aliev and Ahmed Awelkair and Boyuan Ma and Zhiqi (Julie) Huang and Yuzhen Mao and Wendong Fan and Philip Torr and Bernard Ghanem and Changran Hu and Urmish Thakker and Guohao Li},
+  title     = {{SETA: Scaling Environments for Terminal Agents}},
+  year      = {2026},
+  month     = jan,
+  url       = {https://github.com/camel-ai/seta},
+  note      = {Blog: \url{https://eigent-ai.notion.site/SETA-Scaling-Environments-for-Terminal-Agents-2d2511c70ba280a9b7c0fe3e7f1b6ab8}}
 }
 ```
