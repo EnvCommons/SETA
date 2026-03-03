@@ -56,7 +56,7 @@ Multi-turn. Agents explore files, write scripts, execute commands, then submit f
 
 ## Environment Difficulty
 
-SETA evaluates terminal-based task completion with deterministic pytest validation across software engineering and system administration domains.
+[Put environment difficulty information here]
 
 ## Other Environment Requirements
 
