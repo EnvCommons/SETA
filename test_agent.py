@@ -5,14 +5,14 @@ import os
 from openai import AsyncOpenAI
 from openreward import AsyncOpenReward
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-5.2")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-5.4")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENREWARD_API_KEY = os.environ.get("OPENREWARD_API_KEY", "dummy")
 
 
 async def main() -> None:
     # Connect to local server
-    or_client = AsyncOpenReward(base_url="http://localhost:8080")
+    or_client = AsyncOpenReward()
     oai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
     # Get environment
@@ -27,7 +27,7 @@ async def main() -> None:
 
     # Test first task (or specify task_id)
     # You can filter by task_id: [t for t in tasks if t.task_spec["task_id"] == 5][0]
-    task = tasks[5]
+    task = tasks[305]
     print(f"\nTesting Task {task.task_spec['task_id']}")
     print(f"Category: {task.task_spec['category']}")
     print(f"Difficulty: {task.task_spec['difficulty']}")
@@ -58,6 +58,7 @@ async def main() -> None:
             # Get model response
             response = await oai_client.responses.create(
                 model=MODEL_NAME,
+                #reasoning={"effort": "high"},
                 tools=tools,
                 input=input_list,
             )

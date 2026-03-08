@@ -4,7 +4,7 @@
 
 ## Description
 
-SETA (Scaling Environments for Terminal Agents) is an environment for evaluating terminal-based coding and system administration capabilities, developed by [CAMEL-AI](https://github.com/camel-ai/seta). It contains 400 tasks covering software engineering (309 tasks), system administration (79 tasks), and DevOps/security/networking (12 tasks). Each task is validated by a pytest test suite with weighted scoring.
+SETA (Scaling Environments for Terminal Agents) is an environment for evaluating terminal-based coding and system administration capabilities, developed by [CAMEL-AI](https://github.com/camel-ai/seta). It contains 1376 tasks covering software engineering (622 tasks), system administration (605 tasks), DevOps (33 tasks), debugging (29 tasks), configuration (35 tasks), security (20 tasks), networking (15 tasks), and other categories. Each task is validated by a pytest test suite with weighted scoring.
 
 ## Capabilities
 
@@ -25,9 +25,9 @@ Agents are given a sandboxed environment with CLI tools (bash, read, write, edit
 
 There is one split in this environment:
 
-- **train**: 400 tasks
+- **train**: 1376 tasks
 
-Difficulty distribution: Easy (1), Medium (347), Hard (52). Tasks span software engineering, system administration, DevOps, security, networking, and debugging categories.
+Difficulty distribution: Easy (25), Medium (629), Hard (722). Tasks span software engineering, system administration, DevOps, security, networking, debugging, and configuration categories.
 
 ## Reward Structure
 

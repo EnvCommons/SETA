@@ -15,12 +15,12 @@ from constants import ENV_PATH
 from utils import upload_text
 
 
-def load_tasks() -> list[dict]:
+def load_tasks() -> dict[int, dict]:
     """
-    Load all 400 SETA tasks from Dataset/ directory.
+    Load all SETA tasks from Dataset/ directory.
 
     Returns:
-        List of task dicts with structure:
+        Dict mapping task_id to task dict with structure:
         {
             "task_id": int,
             "instruction": str,
@@ -36,9 +36,9 @@ def load_tasks() -> list[dict]:
             "author_email": str,
         }
     """
-    tasks = []
+    tasks = {}
 
-    for task_id in range(400):
+    for task_id in range(1376):
         task_dir = ENV_PATH / "Dataset" / str(task_id)
 
         # Load task.yaml
@@ -75,7 +75,7 @@ def load_tasks() -> list[dict]:
             "author_email": task_yaml.get("author_email", ""),
         }
 
-        tasks.append(task)
+        tasks[task_id] = task
 
     #print(f"Loaded {len(tasks)} SETA tasks")
     return tasks
@@ -148,9 +148,9 @@ class EmptyInput(BaseModel):
 
 class SETAEnv(CLIEnvironment):
     """
-    SETA (Synthetic Environment for Terminal Agents) environment.
+    SETA (Scaling Environments for Terminal Agents) environment.
 
-    400 terminal-based coding and system administration tasks with automated
+    Terminal-based coding and system administration tasks with automated
     pytest validation. Agents use CLI tools (bash, read, write, etc.) to
     complete tasks, then submit for scoring.
     """
@@ -166,7 +166,7 @@ class SETAEnv(CLIEnvironment):
         Return task specifications for requested split.
 
         Args:
-            split: Only "train" is supported (all 400 tasks)
+            split: Only "train" is supported
 
         Returns:
             List of task specs with metadata
@@ -181,7 +181,7 @@ class SETAEnv(CLIEnvironment):
                 "category": task["category"],
                 "tags": task["tags"],
             }
-            for task in TASKS
+            for task in TASKS.values()
         ]
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
@@ -195,6 +195,8 @@ class SETAEnv(CLIEnvironment):
         super().__init__(task_spec, secrets=secrets)
 
         self.task_id = int(task_spec["task_id"])
+        if self.task_id not in TASKS:
+            raise ValueError(f"Task ID {self.task_id} not found in loaded tasks")
         self.task_data = TASKS[self.task_id]
 
         # Validate API key

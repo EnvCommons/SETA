@@ -1,5 +1,5 @@
 {
-    "test_library_files_removed": 0.4,
-    "test_header_and_config_files_removed": 0.35,
-    "test_pkg_config_removed": 0.25
+    "test_application_installed_correctly": 0.3,
+    "test_desktop_file_exists_and_valid": 0.4,
+    "test_application_executes_successfully": 0.3
 }
