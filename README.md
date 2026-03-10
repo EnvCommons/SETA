@@ -78,3 +78,4 @@ Agents in SETA operate within sandboxed environments. Commands are executed in i
   note      = {Blog: \url{https://eigent-ai.notion.site/SETA-Scaling-Environments-for-Terminal-Agents-2d2511c70ba280a9b7c0fe3e7f1b6ab8}}
 }
 ```
+
