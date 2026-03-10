@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import yaml
 from pathlib import Path
 from typing import Any, List, Dict
 
@@ -17,7 +16,9 @@ from utils import upload_text
 
 def load_tasks() -> dict[int, dict]:
     """
-    Load all SETA tasks from Dataset/ directory.
+    Load all SETA tasks from pre-built task_index.json.
+
+    Run build_task_index.py to regenerate the index if tasks change.
 
     Returns:
         Dict mapping task_id to task dict with structure:
@@ -27,58 +28,13 @@ def load_tasks() -> dict[int, dict]:
             "difficulty": str,
             "category": str,
             "tags": list[str],
-            "max_agent_timeout_sec": int,
-            "max_test_timeout_sec": int,
             "weights": dict[str, float],  # test_name -> weight
-            "parser_name": str,
-            "run_tests_in_same_shell": bool,
-            "author_name": str,
-            "author_email": str,
         }
     """
-    tasks = {}
-
-    for task_id in range(1376):
-        task_dir = ENV_PATH / "Dataset" / str(task_id)
-
-        # Load task.yaml
-        task_yaml_path = task_dir / "task.yaml"
-        if not task_yaml_path.exists():
-            #print(f"Warning: Missing task.yaml for task {task_id}")
-            continue
-
-        with open(task_yaml_path, "r") as f:
-            task_yaml = yaml.safe_load(f)
-
-        # Load weights.json
-        weights_path = task_dir / "weights.json"
-        if not weights_path.exists():
-            #print(f"Warning: Missing weights.json for task {task_id}")
-            weights = {}
-        else:
-            with open(weights_path, "r") as f:
-                weights = json.load(f)
-
-        # Combine into single task dict
-        task = {
-            "task_id": task_id,
-            "instruction": task_yaml.get("instruction", ""),
-            "difficulty": task_yaml.get("difficulty", "medium"),
-            "category": task_yaml.get("category", "unknown"),
-            "tags": task_yaml.get("tags", []),
-            "max_agent_timeout_sec": task_yaml.get("max_agent_timeout_sec", 360),
-            "max_test_timeout_sec": task_yaml.get("max_test_timeout_sec", 60),
-            "parser_name": task_yaml.get("parser_name", "pytest"),
-            "run_tests_in_same_shell": task_yaml.get("run_tests_in_same_shell", False),
-            "weights": weights,
-            "author_name": task_yaml.get("author_name", "anonymous"),
-            "author_email": task_yaml.get("author_email", ""),
-        }
-
-        tasks[task_id] = task
-
-    #print(f"Loaded {len(tasks)} SETA tasks")
-    return tasks
+    index_path = ENV_PATH / "task_index.json"
+    with open(index_path, "r") as f:
+        raw = json.load(f)
+    return {int(k): v for k, v in raw.items()}
 
 
 # Load tasks at module import time
