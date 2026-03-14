@@ -162,7 +162,7 @@ class SETAEnv(CLIEnvironment):
         # Setup sandbox with base image
         # User will build task-specific images later, for now use base image
         self.sandbox_settings = SandboxSettings(
-            environment="GeneralReasoning/SETA",
+            environment="Eigent/SETA",
             image="generalreasoning/seta-base@sha256:369515ae30815448a3b2e0189c5ef3df40786edc2a611f6bb1d3bc6b5636c363",
             machine_size="0.5:1",
             block_network=False,
