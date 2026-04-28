@@ -1,4 +1,4 @@
-openreward>=0.1.109
+openreward
 pydantic>=2.0
 pytest>=8.4.1
 pytest-json-report>=1.5.0
