@@ -27,7 +27,7 @@ There is one split in this environment:
 
 - **train**: 1376 tasks
 
-Difficulty distribution: Easy (25), Medium (629), Hard (722). Tasks span software engineering, system administration, DevOps, security, networking, debugging, and configuration categories.
+Tasks span software engineering, system administration, DevOps, security, networking, debugging, and configuration categories.
 
 ## Reward Structure
 
@@ -56,7 +56,7 @@ Multi-turn. Agents explore files, write scripts, execute commands, then submit f
 
 ## Environment Difficulty
 
-[Put environment difficulty information here]
+Difficulty distribution: Easy (25), Medium (629), Hard (722).
 
 ## Other Environment Requirements
 
