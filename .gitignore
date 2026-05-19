@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Transient local cache of task data downloaded from the source bucket
+# (gs://openreward-user-upload/.../Dataset). The bucket is the source of
+# truth — this dir gets re-populated on demand by scripts/build_task_images.py.
+.cache/
+
+# The Dataset/ tree previously held per-task data files for ~400 of the
+# 1376 tasks. Source of truth now lives in the source bucket; do not check
+# task data back into git.
+Dataset/
+
+scripts/run.md

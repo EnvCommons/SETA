@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 
 from openreward.environments import JSONObject, TextBlock, ToolOutput, tool
 from openreward import SandboxSettings, SandboxBucketConfig, AsyncOpenReward
@@ -12,6 +12,27 @@ from pydantic import BaseModel
 from cli_environment import CLIEnvironment
 from constants import ENV_PATH
 from utils import upload_text
+
+
+SETA_BASE_IMAGE = (
+    "generalreasoning/seta-base"
+    "@sha256:369515ae30815448a3b2e0189c5ef3df40786edc2a611f6bb1d3bc6b5636c363"
+)
+PER_TASK_IMAGE_PREFIX = "generalreasoning/eigent-seta"
+
+
+def load_task_images() -> dict[str, str]:
+    """Load task_images.json: {task_id_str: task_image_digest}.
+
+    Returns an empty dict if the file is missing. Tasks without an entry
+    fall back to the seta-base image + runtime dockerfile_to_bash setup.
+    """
+    path = ENV_PATH / "task_images.json"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    return {str(k): v["task_image_digest"] for k, v in raw.items() if v.get("task_image_digest")}
 
 
 def load_tasks() -> dict[int, dict]:
@@ -39,6 +60,7 @@ def load_tasks() -> dict[int, dict]:
 
 # Load tasks at module import time
 TASKS = load_tasks()
+TASK_IMAGES = load_task_images()
 
 
 def dockerfile_to_bash(dockerfile_content: str, task_id: int) -> str:
@@ -159,11 +181,20 @@ class SETAEnv(CLIEnvironment):
         if not secrets.get("api_key"):
             raise ValueError("OpenReward API key required in secrets")
 
-        # Setup sandbox with base image
-        # User will build task-specific images later, for now use base image
+        # Prefer the per-task image when available (built by
+        # scripts/build_task_images.py and recorded in task_images.json).
+        # Falls back to seta-base + runtime dockerfile_to_bash setup when
+        # no entry exists, so newly-added tasks keep working until they
+        # have been built.
+        self._task_image_digest: Optional[str] = TASK_IMAGES.get(str(self.task_id))
+        if self._task_image_digest is not None:
+            image = f"{PER_TASK_IMAGE_PREFIX}@{self._task_image_digest}"
+        else:
+            image = SETA_BASE_IMAGE
+
         self.sandbox_settings = SandboxSettings(
             environment="Eigent/SETA",
-            image="generalreasoning/seta-base@sha256:369515ae30815448a3b2e0189c5ef3df40786edc2a611f6bb1d3bc6b5636c363",
+            image=image,
             machine_size="0.5:1",
             block_network=False,
             bucket_config=SandboxBucketConfig(
@@ -182,9 +213,19 @@ class SETAEnv(CLIEnvironment):
         """
         Start sandbox and execute task-specific Dockerfile setup.
 
-        Converts the Dockerfile to a bash script and executes it once.
+        When the task has a pre-built image (image_sha.txt resolved at init),
+        the image already contains the Dockerfile's installs and nothing
+        more is needed. Otherwise, fall back to converting the Dockerfile
+        to a bash script and executing it inside a seta-base sandbox.
         """
         await self.sandbox.start()
+
+        if self._task_image_digest is not None:
+            print(
+                f"[SETUP SUCCESS] Task {self.task_id} on pre-built image "
+                f"@{self._task_image_digest[:19]}..."
+            )
+            return
 
         try:
             # Download Dockerfile (task directory mounted at /orwd_data via only_dir)
