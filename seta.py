@@ -4,14 +4,13 @@ import json
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 
-from openreward.environments import JSONObject, TextBlock, ToolOutput, tool
+from openreward.environments import Environment, JSONObject, TextBlock, ToolOutput, tool, upload_text
+from openreward.toolsets import CLIToolset
 from openreward import SandboxSettings, SandboxBucketConfig, AsyncOpenReward
 
 from pydantic import BaseModel
 
-from cli_environment import CLIEnvironment
 from constants import ENV_PATH
-from utils import upload_text
 
 
 SETA_BASE_IMAGE = (
@@ -124,7 +123,7 @@ class EmptyInput(BaseModel):
     pass
 
 
-class SETAEnv(CLIEnvironment):
+class SETAEnv(Environment):
     """
     SETA (Scaling Environments for Terminal Agents) environment.
 
@@ -132,6 +131,10 @@ class SETAEnv(CLIEnvironment):
     pytest validation. Agents use CLI tools (bash, read, write, etc.) to
     complete tasks, then submit for scoring.
     """
+
+    # 9-tool sandboxed CLI surface provided by the SDK. The class attribute
+    # makes the framework auto-instantiate the toolset against self.sandbox.
+    toolsets = [CLIToolset]
 
     @classmethod
     def list_splits(cls) -> list[str]:
@@ -170,7 +173,7 @@ class SETAEnv(CLIEnvironment):
             task_spec: Task specification with task_id
             secrets: Must contain 'api_key' for sandbox access
         """
-        super().__init__(task_spec, secrets=secrets)
+        super().__init__(task_spec)
 
         self.task_id = int(task_spec["task_id"])
         if self.task_id not in TASKS:
@@ -206,8 +209,6 @@ class SETAEnv(CLIEnvironment):
 
         or_client = AsyncOpenReward(api_key=secrets.get("api_key"))
         self.sandbox = or_client.sandbox(self.sandbox_settings)
-
-        self.todos: List[Dict[str, Any]] = []
 
     async def setup(self) -> None:
         """
@@ -274,6 +275,9 @@ class SETAEnv(CLIEnvironment):
         except Exception as e:
             print(f"[SETUP ERROR] Failed to setup task {self.task_id}: {e}")
             # Don't raise - allow task to continue
+
+    async def teardown(self) -> None:
+        await self.sandbox.stop()
 
     async def get_prompt(self) -> List[TextBlock]:
         """
