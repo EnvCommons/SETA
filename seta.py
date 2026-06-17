@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, List, Dict, Optional
@@ -305,89 +306,50 @@ class SETAEnv(Environment):
             - reward: Final score (0.0 to 1.0)
             - finished: True (ends episode)
         """
-        try:
+        # Run the test suite in the sandbox and parse the JSON report. The sandbox
+        # round-trip is the grader's flaky external op; _run_tests_with_retry retries
+        # transient failures and then *raises* on a persistent failure (sandbox dead,
+        # pytest couldn't run/write the report) so the SDK turns it into ToolFailed ->
+        # a clean terminal. We do NOT fabricate reward=0.0 for a grader failure — a
+        # legitimately failing solution still produces a report (pytest-json-report
+        # records failures/collection errors) and gets a real low score below.
+        report = await self._run_tests_with_retry()
 
-            # Step 2: Ensure test directory structure exists and copy files
-            # The task directory is mounted at /orwd_data/ via only_dir parameter
-            await self.sandbox.run("mkdir -p /app/tests")
+        # Parse test results
+        passed_tests = set()
+        failed_tests = set()
 
-            # Copy test file
-            await self.sandbox.run(
-                "cp /orwd_data/tests/test_outputs.py /app/tests/"
-            )
+        for test in report.get("tests", []):
+            # Extract test function name from nodeid
+            # Example nodeid: "tests/test_outputs.py::test_user_accounts_created"
+            test_name = test["nodeid"].split("::")[-1]
 
-            # Copy any data files that the task needs (excluding tests/ directory and Dockerfile)
-            copy_result = await self.sandbox.run(
-                "find /orwd_data/ -maxdepth 1 -type f ! -name 'Dockerfile' -exec cp {} /app/ \\;"
-            )
+            if test["outcome"] == "passed":
+                passed_tests.add(test_name)
+            else:
+                failed_tests.add(test_name)
 
-            # Step 3: Run tests with JSON output
-            test_timeout = self.task_data.get("max_test_timeout_sec", 60)
+        # Step 5: Calculate weighted score
+        weights = self.task_data["weights"]
+        total_score = 0.0
 
-            # Run pytest directly with json-report
-            test_result = await self.sandbox.run(
-                "cd /app && pytest tests/test_outputs.py -rA --json-report --json-report-file=/app/report.json"
-            )
+        for test_name, weight in weights.items():
+            if test_name in passed_tests:
+                total_score += weight
 
-            # Step 4: Download and parse JSON report
-            try:
-                report_content = await self.sandbox.download("/app/report.json")
-                report = json.loads(report_content)
-            except Exception as e:
-                return ToolOutput(
-                    blocks=[TextBlock(text=f"""
-Test Report Not Found
-=====================
+        # Normalize score to 0.0-1.0 range
+        total_weight = sum(weights.values())
+        if total_weight > 0:
+            total_score = total_score / total_weight
 
-Task ID: {self.task_id}
-Error: Could not read test report - {str(e)}
+        # Step 6: Format results for display
+        test_details = []
+        for test_name in weights.keys():
+            status = "✓ PASSED" if test_name in passed_tests else "✗ FAILED"
+            weight = weights[test_name]
+            test_details.append(f"  {status} | {test_name} (weight: {weight:.2f})")
 
-This may indicate that pytest failed to run. Check test execution output above.
-""")],
-                    metadata={
-                        "task_id": self.task_id,
-                        "error": "report_not_found",
-                        "details": str(e),
-                    },
-                    reward=0.0,
-                    finished=True
-                )
-
-            # Parse test results
-            passed_tests = set()
-            failed_tests = set()
-
-            for test in report.get("tests", []):
-                # Extract test function name from nodeid
-                # Example nodeid: "tests/test_outputs.py::test_user_accounts_created"
-                test_name = test["nodeid"].split("::")[-1]
-
-                if test["outcome"] == "passed":
-                    passed_tests.add(test_name)
-                else:
-                    failed_tests.add(test_name)
-
-            # Step 5: Calculate weighted score
-            weights = self.task_data["weights"]
-            total_score = 0.0
-
-            for test_name, weight in weights.items():
-                if test_name in passed_tests:
-                    total_score += weight
-
-            # Normalize score to 0.0-1.0 range
-            total_weight = sum(weights.values())
-            if total_weight > 0:
-                total_score = total_score / total_weight
-
-            # Step 6: Format results for display
-            test_details = []
-            for test_name in weights.keys():
-                status = "✓ PASSED" if test_name in passed_tests else "✗ FAILED"
-                weight = weights[test_name]
-                test_details.append(f"  {status} | {test_name} (weight: {weight:.2f})")
-
-            summary_text = f"""
+        summary_text = f"""
 Test Execution Complete
 ========================
 
@@ -402,44 +364,53 @@ Passed: {len(passed_tests)}/{len(weights)}
 Final Score: {total_score:.2%}
 """
 
-            return ToolOutput(
-                blocks=[TextBlock(text=summary_text)],
-                metadata={
-                    "task_id": self.task_id,
-                    "score": total_score,
-                    "passed_tests": list(passed_tests),
-                    "failed_tests": list(failed_tests),
-                    "test_count": len(weights),
-                    "weights": weights,
-                },
-                reward=total_score,
-                finished=True
-            )
+        return ToolOutput(
+            blocks=[TextBlock(text=summary_text)],
+            metadata={
+                "task_id": self.task_id,
+                "score": total_score,
+                "passed_tests": list(passed_tests),
+                "failed_tests": list(failed_tests),
+                "test_count": len(weights),
+                "weights": weights,
+            },
+            reward=total_score,
+            finished=True
+        )
 
-        except Exception as e:
-            # Handle errors gracefully
-            error_text = f"""
-Test Execution Failed
-=====================
+    async def _run_tests_with_retry(self, *, max_attempts: int = 3) -> dict:
+        """Run the pytest suite in the sandbox and return the parsed JSON report.
 
-Task ID: {self.task_id}
-Error: {str(e)}
-
-The test suite encountered an error. Please check:
-1. Your solution is complete
-2. All required files are in place
-3. The sandbox environment is properly configured
-
-You may try running the tests again with submit_solution.
-"""
-
-            return ToolOutput(
-                blocks=[TextBlock(text=error_text)],
-                metadata={
-                    "task_id": self.task_id,
-                    "error": str(e),
-                    "score": 0.0,
-                },
-                reward=0.0,
-                finished=True
-            )
+        The sandbox round-trip (mkdir/cp/pytest/download) is the grader's flaky
+        external op. Transient failures are retried; after ``max_attempts`` the last
+        exception is re-raised so the tool fails loudly (the SDK turns it into
+        ToolFailed -> terminal) instead of swallowing a grader/sandbox failure into
+        a fabricated reward=0.0. A genuinely failing solution is NOT an exception —
+        pytest still writes report.json (recording failures/collection errors), so it
+        returns normally here and is scored as a real low result by the caller.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                # Ensure test directory structure exists and copy files. The task
+                # directory is mounted at /orwd_data/ via the only_dir parameter.
+                await self.sandbox.run("mkdir -p /app/tests")
+                await self.sandbox.run("cp /orwd_data/tests/test_outputs.py /app/tests/")
+                # Copy data files the task needs (excluding tests/ and Dockerfile).
+                await self.sandbox.run(
+                    "find /orwd_data/ -maxdepth 1 -type f ! -name 'Dockerfile' -exec cp {} /app/ \\;"
+                )
+                # Run pytest with a JSON report.
+                await self.sandbox.run(
+                    "cd /app && pytest tests/test_outputs.py -rA --json-report --json-report-file=/app/report.json"
+                )
+                report_content = await self.sandbox.download("/app/report.json")
+                return json.loads(report_content)
+            except Exception as e:
+                last_exc = e
+                if attempt < max_attempts - 1:
+                    wait = min(2 ** attempt, 30)
+                    print(f"SETA GRADER ERROR: {type(e).__name__}: {e} | retry in {wait}s (attempt {attempt + 1}/{max_attempts})")
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
