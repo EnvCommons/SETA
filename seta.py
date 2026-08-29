@@ -119,6 +119,11 @@ def dockerfile_to_bash(dockerfile_content: str, task_id: int) -> str:
     return '\n'.join(bash_lines)
 
 
+# Reward for a submission made after the task has already been graded. Negative
+# so repeat submissions are actively discouraged, not merely left unscored.
+REPEAT_SUBMISSION_PENALTY = -0.1
+
+
 class EmptyInput(BaseModel):
     """Empty params for submit_solution tool."""
     pass
@@ -175,6 +180,11 @@ class SETAEnv(Environment):
             secrets: Must contain 'api_key' for sandbox access
         """
         super().__init__(task_spec)
+
+        # Scored submissions this session. submit_solution runs the test suite and
+        # reports passed/total back, so an uncapped tool is a free CI loop against
+        # the graded tests: edit, submit, read the score, edit again.
+        self.submitted = 0
 
         self.task_id = int(task_spec["task_id"])
         if self.task_id not in TASKS:
@@ -306,6 +316,16 @@ class SETAEnv(Environment):
             - reward: Final score (0.0 to 1.0)
             - finished: True (ends episode)
         """
+        if self.submitted > 0:
+            return ToolOutput(
+                blocks=[TextBlock(text="A solution has already been submitted for this task. "
+                                       "This episode is over: it is not re-scored, and repeat "
+                                       "submissions are penalised (reward -0.1).")],
+                metadata={"already_submitted": True, "submission_count": self.submitted},
+                reward=REPEAT_SUBMISSION_PENALTY,
+                finished=True,
+            )
+
         # Run the test suite in the sandbox and parse the JSON report. The sandbox
         # round-trip is the grader's flaky external op; _run_tests_with_retry retries
         # transient failures and then *raises* on a persistent failure (sandbox dead,
@@ -363,6 +383,10 @@ Test Results:
 Passed: {len(passed_tests)}/{len(weights)}
 Final Score: {total_score:.2%}
 """
+
+        # _run_tests_with_retry raises on a persistent failure before this, so a
+        # flaky sandbox does not consume the attempt.
+        self.submitted += 1
 
         return ToolOutput(
             blocks=[TextBlock(text=summary_text)],
