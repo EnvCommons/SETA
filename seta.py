@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
+import io
 import json
+import secrets as secrets_lib
+import shlex
+import tarfile
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 
 from openreward.environments import Environment, JSONObject, TextBlock, ToolOutput, tool, upload_text
 from openreward.toolsets import CLIToolset
-from openreward import SandboxSettings, SandboxBucketConfig, AsyncOpenReward
+from openreward import SandboxSettings, AsyncOpenReward
 
 from pydantic import BaseModel
 
@@ -19,6 +25,34 @@ SETA_BASE_IMAGE = (
     "@sha256:369515ae30815448a3b2e0189c5ef3df40786edc2a611f6bb1d3bc6b5636c363"
 )
 PER_TASK_IMAGE_PREFIX = "generalreasoning/eigent-seta"
+
+# Per-task data on the env server: DATASET_DIR/<task_id>/ holds the task inputs
+# next to the grader files (tests/, solution.sh, ...). The agent sandbox does not
+# mount it: setup copies in only the task inputs, and submit_solution copies in
+# the test suite just for the duration of the pytest run.
+DATASET_DIR = ENV_PATH / "Dataset"
+TESTS_SUBDIR = "tests"
+# Top-level files of a task dir that are reference/grader material, never task inputs.
+REFERENCE_FILES = frozenset({
+    "Dockerfile",
+    "docker-compose.yaml",
+    "draft_spec.md",
+    "run-tests.sh",
+    "solution.sh",
+    "task.yaml",
+    "weights.json",
+})
+# Sandbox dir where Dockerfile COPY sources are staged during setup; removed after.
+SETUP_STAGING_DIR = "/tmp/seta-task-files"
+# The base image installs pytest and pytest-json-report for python3.12 only, and
+# some tasks repoint /usr/bin/python3 (the pytest script's shebang), so the
+# grader names its interpreter explicitly. -P keeps the cwd off sys.path, as
+# when pytest runs as a script.
+GRADER_PYTHON = "/usr/bin/python3.12"
+# base64 characters per sandbox command; the sandbox /run endpoint rejects
+# request bodies over ~4 MiB.
+UPLOAD_CHUNK_CHARS = 1 << 20
+GRADER_PYTEST_INI = b"[pytest]\n"
 
 
 def load_task_images() -> dict[str, str]:
@@ -102,12 +136,12 @@ def dockerfile_to_bash(dockerfile_content: str, task_id: int) -> str:
             path = stripped[8:].strip()
             bash_lines.append(f'mkdir -p {path} && cd {path}')
         elif stripped.startswith('COPY '):
-            # Adjust COPY source paths to point to /orwd_data
+            # COPY sources are staged in SETUP_STAGING_DIR before the script runs
             copy_args = stripped[5:].strip().split()
             if len(copy_args) >= 2:
                 src = copy_args[0]
                 dst = copy_args[-1]  # Last argument is destination
-                bash_lines.append(f'cp -r /orwd_data/{src} {dst}')
+                bash_lines.append(f'cp -r {SETUP_STAGING_DIR}/{src} {dst}')
         elif stripped.startswith('ENV '):
             # Convert to export
             env_def = stripped[4:].strip()
@@ -117,6 +151,21 @@ def dockerfile_to_bash(dockerfile_content: str, task_id: int) -> str:
             bash_lines.append(line)
 
     return '\n'.join(bash_lines)
+
+
+def task_input_files(task_dir: Path) -> dict[str, Path]:
+    """Files and dirs of a task that may be placed in the agent sandbox.
+
+    Everything in the task dir except the tests/ dir and the top-level
+    REFERENCE_FILES, keyed by path relative to task_dir.
+    """
+    entries: dict[str, Path] = {}
+    for path in sorted(task_dir.rglob("*")):
+        rel = path.relative_to(task_dir)
+        if rel.parts[0] == TESTS_SUBDIR or (len(rel.parts) == 1 and rel.name in REFERENCE_FILES):
+            continue
+        entries[rel.as_posix()] = path
+    return entries
 
 
 # Reward for a submission made after the task has already been graded. Negative
@@ -185,11 +234,14 @@ class SETAEnv(Environment):
         # reports passed/total back, so an uncapped tool is a free CI loop against
         # the graded tests: edit, submit, read the score, edit again.
         self.submitted = 0
+        # Concurrent submit_solution calls share one sandbox and one attempt.
+        self._submit_lock = asyncio.Lock()
 
         self.task_id = int(task_spec["task_id"])
         if self.task_id not in TASKS:
             raise ValueError(f"Task ID {self.task_id} not found in loaded tasks")
         self.task_data = TASKS[self.task_id]
+        self.task_dir = DATASET_DIR / str(self.task_id)
 
         # Validate API key
         if not secrets.get("api_key"):
@@ -211,11 +263,6 @@ class SETAEnv(Environment):
             image=image,
             machine_size="0.5:1",
             block_network=False,
-            bucket_config=SandboxBucketConfig(
-                mount_path="/orwd_data",
-                read_only=True,
-                only_dir=f"Dataset/{self.task_id}"
-            )
         )
 
         or_client = AsyncOpenReward(api_key=secrets.get("api_key"))
@@ -240,16 +287,17 @@ class SETAEnv(Environment):
             return
 
         try:
-            # Download Dockerfile (task directory mounted at /orwd_data via only_dir)
-            dockerfile_path = "/orwd_data/Dockerfile"
-            #print(f"[SETUP] Reading Dockerfile: {dockerfile_path}")
-
-            dockerfile_bytes = await self.sandbox.download(dockerfile_path)
-            dockerfile_text = dockerfile_bytes.decode('utf-8')
+            # Read the Dockerfile from the env server's copy of the task data
+            dockerfile_text = (self.task_dir / "Dockerfile").read_text(encoding="utf-8")
 
             # Convert to bash script
             bash_script = dockerfile_to_bash(dockerfile_text, self.task_id)
             #print(f"[SETUP] Generated bash script ({len(bash_script)} bytes)")
+
+            # Stage the task inputs the Dockerfile COPYs from (never tests or reference files)
+            inputs = task_input_files(self.task_dir)
+            if inputs and not await self._upload_files(inputs, SETUP_STAGING_DIR):
+                print(f"[SETUP WARNING] Could not stage task inputs for task {self.task_id}")
 
             # Upload script to sandbox
             await upload_text(self.sandbox, "/tmp/setup.sh", bash_script)
@@ -266,22 +314,7 @@ class SETAEnv(Environment):
             else:
                 print(f"[SETUP SUCCESS] Task {self.task_id} setup completed")
 
-            # Cleanup: Delete metadata files that shouldn't be visible to agent
-            cleanup_files = [
-                "docker-compose.yaml",
-                "Dockerfile",
-                "draft_spec.md",
-                "solution.sh",
-                "task.yaml"
-            ]
-
-            #print(f"[SETUP] Cleaning up metadata files...")
-            for filename in cleanup_files:
-                file_path = f"/orwd_data/{filename}"
-                cleanup_output, cleanup_code = await self.sandbox.run(f"rm -f {file_path}")
-                if cleanup_code == 0:
-                    print(f"[SETUP] Deleted {filename}")
-
+            await self.sandbox.run(f"rm -rf {SETUP_STAGING_DIR} /tmp/setup.sh")
 
         except Exception as e:
             print(f"[SETUP ERROR] Failed to setup task {self.task_id}: {e}")
@@ -307,15 +340,19 @@ class SETAEnv(Environment):
         Submit solution and run test suite.
 
         Executes pytest tests in sandbox, calculates weighted score,
-        and returns detailed results.
+        and returns the result.
 
         Returns:
             ToolOutput with:
-            - blocks: Formatted test results and score
-            - metadata: Structured test data
+            - blocks: Pass count and score
+            - metadata: Score and counts
             - reward: Final score (0.0 to 1.0)
             - finished: True (ends episode)
         """
+        async with self._submit_lock:
+            return await self._submit()
+
+    async def _submit(self) -> ToolOutput:
         if self.submitted > 0:
             return ToolOutput(
                 blocks=[TextBlock(text="A solution has already been submitted for this task. "
@@ -326,18 +363,35 @@ class SETAEnv(Environment):
                 finished=True,
             )
 
+        weights = self.task_data["weights"]
+
         # Run the test suite in the sandbox and parse the JSON report. The sandbox
         # round-trip is the grader's flaky external op; _run_tests_with_retry retries
-        # transient failures and then *raises* on a persistent failure (sandbox dead,
-        # pytest couldn't run/write the report) so the SDK turns it into ToolFailed ->
-        # a clean terminal. We do NOT fabricate reward=0.0 for a grader failure — a
-        # legitimately failing solution still produces a report (pytest-json-report
-        # records failures/collection errors) and gets a real low score below.
+        # transient failures and then *raises* on a persistent sandbox failure so the
+        # SDK turns it into ToolFailed -> a clean terminal. A failing solution still
+        # produces a report (pytest-json-report records failures/collection errors)
+        # and gets a real low score below. When the sandbox answers but the suite
+        # cannot run at all (no report, e.g. the solution broke the interpreter), the
+        # attempt is scored 0.
         report = await self._run_tests_with_retry()
+        self.submitted += 1
+
+        if report is None:
+            return ToolOutput(
+                blocks=[TextBlock(text="The test suite could not run in the sandbox; this submission is scored 0.")],
+                metadata={
+                    "task_id": self.task_id,
+                    "score": 0.0,
+                    "passed_count": 0,
+                    "test_count": len(weights),
+                    "tests_ran": False,
+                },
+                reward=0.0,
+                finished=True,
+            )
 
         # Parse test results
         passed_tests = set()
-        failed_tests = set()
 
         for test in report.get("tests", []):
             # Extract test function name from nodeid
@@ -346,29 +400,22 @@ class SETAEnv(Environment):
 
             if test["outcome"] == "passed":
                 passed_tests.add(test_name)
-            else:
-                failed_tests.add(test_name)
 
-        # Step 5: Calculate weighted score
-        weights = self.task_data["weights"]
+        # Calculate weighted score
         total_score = 0.0
+        passed_count = 0
 
         for test_name, weight in weights.items():
             if test_name in passed_tests:
                 total_score += weight
+                passed_count += 1
 
         # Normalize score to 0.0-1.0 range
         total_weight = sum(weights.values())
         if total_weight > 0:
             total_score = total_score / total_weight
 
-        # Step 6: Format results for display
-        test_details = []
-        for test_name in weights.keys():
-            status = "✓ PASSED" if test_name in passed_tests else "✗ FAILED"
-            weight = weights[test_name]
-            test_details.append(f"  {status} | {test_name} (weight: {weight:.2f})")
-
+        # Counts and score only: test names and weights describe the hidden suite.
         summary_text = f"""
 Test Execution Complete
 ========================
@@ -377,59 +424,115 @@ Task ID: {self.task_id}
 Category: {self.task_data.get('category', 'unknown')}
 Difficulty: {self.task_data.get('difficulty', 'unknown')}
 
-Test Results:
-{chr(10).join(test_details)}
-
-Passed: {len(passed_tests)}/{len(weights)}
+Passed: {passed_count}/{len(weights)}
 Final Score: {total_score:.2%}
 """
-
-        # _run_tests_with_retry raises on a persistent failure before this, so a
-        # flaky sandbox does not consume the attempt.
-        self.submitted += 1
 
         return ToolOutput(
             blocks=[TextBlock(text=summary_text)],
             metadata={
                 "task_id": self.task_id,
                 "score": total_score,
-                "passed_tests": list(passed_tests),
-                "failed_tests": list(failed_tests),
+                "passed_count": passed_count,
                 "test_count": len(weights),
-                "weights": weights,
+                "tests_ran": True,
             },
             reward=total_score,
             finished=True
         )
 
-    async def _run_tests_with_retry(self, *, max_attempts: int = 3) -> dict:
+    async def _upload_files(self, files: dict[str, Path | bytes], dest_dir: str) -> bool:
+        """Copy ``files`` ({relative path: server path or content}) into ``dest_dir`` in the sandbox.
+
+        The files travel as one gzipped tar, base64-encoded in chunks that fit the
+        sandbox request body limit. Returns False if a shell step exits non-zero
+        (the sandbox answers but its filesystem or tools are broken); sandbox and
+        transport errors propagate.
+        """
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for arcname, source in files.items():
+                if isinstance(source, bytes):
+                    info = tarfile.TarInfo(arcname)
+                    info.size = len(source)
+                    info.mode = 0o644
+                    tar.addfile(info, io.BytesIO(source))
+                else:
+                    tar.add(source, arcname=arcname, recursive=False)
+        payload = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        dest = shlex.quote(dest_dir)
+        b64_path = f"/tmp/.upload-{secrets_lib.token_hex(8)}.b64"
+        result = await self.sandbox.run(f"mkdir -p {dest} && : > {b64_path}")
+        if result.return_code != 0:
+            return False
+        for start in range(0, len(payload), UPLOAD_CHUNK_CHARS):
+            chunk = payload[start:start + UPLOAD_CHUNK_CHARS]
+            result = await self.sandbox.run(f"printf '%s' '{chunk}' >> {b64_path}")
+            if result.return_code != 0:
+                return False
+        # -m and --no-same-* give the extracted files the ownership, mode and mtime
+        # a plain `cp -r` by root would.
+        result = await self.sandbox.run(
+            f"set -o pipefail; base64 -d {b64_path} | tar -xzmf - -C {dest} "
+            f"--no-same-owner --no-same-permissions; rc=$?; rm -f {b64_path}; exit $rc"
+        )
+        return result.return_code == 0
+
+    async def _run_tests_once(self) -> Optional[dict]:
+        """One grading pass. Returns the pytest JSON report, or None if the suite
+        could not produce one."""
+        # A fresh, unguessable dir per pass: the agent cannot pre-place files in it,
+        # and it is removed as soon as the report is read.
+        grader_dir = f"/tmp/.grader-{secrets_lib.token_hex(8)}"
+        report_path = f"{grader_dir}/report.json"
+        grader_files = {
+            f"{TESTS_SUBDIR}/test_outputs.py": self.task_dir / TESTS_SUBDIR / "test_outputs.py",
+            # The grader's own pytest.ini pins rootdir to grader_dir, so ini and
+            # conftest files elsewhere in the sandbox do not apply.
+            "pytest.ini": GRADER_PYTEST_INI,
+        }
+        # Top-level task inputs are refreshed into /app for the tests.
+        data_files = {
+            path.name: path
+            for path in sorted(self.task_dir.iterdir())
+            if path.is_file() and path.name not in REFERENCE_FILES
+        }
+        try:
+            if not await self._upload_files(grader_files, grader_dir):
+                return None
+            if data_files and not await self._upload_files(data_files, "/app"):
+                return None
+            await self.sandbox.run(
+                f"mkdir -p /app && cd /app && {GRADER_PYTHON} -P -m pytest "
+                f"{grader_dir}/{TESTS_SUBDIR}/test_outputs.py -rA "
+                f"--json-report --json-report-file={report_path}"
+            )
+            if (await self.sandbox.run(f"test -f {report_path}")).return_code != 0:
+                return None
+            report_content = await self.sandbox.download(report_path)
+        finally:
+            # Best effort: a lost sandbox already fails the pass with its own error.
+            with contextlib.suppress(Exception):
+                await self.sandbox.run(f"rm -rf {grader_dir}")
+        try:
+            return json.loads(report_content)
+        except ValueError:
+            return None
+
+    async def _run_tests_with_retry(self, *, max_attempts: int = 3) -> Optional[dict]:
         """Run the pytest suite in the sandbox and return the parsed JSON report.
 
-        The sandbox round-trip (mkdir/cp/pytest/download) is the grader's flaky
-        external op. Transient failures are retried; after ``max_attempts`` the last
-        exception is re-raised so the tool fails loudly (the SDK turns it into
-        ToolFailed -> terminal) instead of swallowing a grader/sandbox failure into
-        a fabricated reward=0.0. A genuinely failing solution is NOT an exception —
-        pytest still writes report.json (recording failures/collection errors), so it
-        returns normally here and is scored as a real low result by the caller.
+        Returns None when the sandbox answers but the suite produces no readable
+        report (scored 0 by the caller). Sandbox/transport failures are retried;
+        after ``max_attempts`` the last exception is re-raised so the tool fails
+        loudly (the SDK turns it into ToolFailed -> terminal) instead of
+        fabricating a score for a grader outage.
         """
         last_exc: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                # Ensure test directory structure exists and copy files. The task
-                # directory is mounted at /orwd_data/ via the only_dir parameter.
-                await self.sandbox.run("mkdir -p /app/tests")
-                await self.sandbox.run("cp /orwd_data/tests/test_outputs.py /app/tests/")
-                # Copy data files the task needs (excluding tests/ and Dockerfile).
-                await self.sandbox.run(
-                    "find /orwd_data/ -maxdepth 1 -type f ! -name 'Dockerfile' -exec cp {} /app/ \\;"
-                )
-                # Run pytest with a JSON report.
-                await self.sandbox.run(
-                    "cd /app && pytest tests/test_outputs.py -rA --json-report --json-report-file=/app/report.json"
-                )
-                report_content = await self.sandbox.download("/app/report.json")
-                return json.loads(report_content)
+                return await self._run_tests_once()
             except Exception as e:
                 last_exc = e
                 if attempt < max_attempts - 1:

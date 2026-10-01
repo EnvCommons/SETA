@@ -97,10 +97,10 @@ Individual tasks range from 1 KB to 5 MB depending on data files.
 
 The SETA environment:
 
-1. **Mounts** `/orwd_data/seta/` (read-only) in the sandbox
+1. **Reads** the task data from the env server's own `/orwd_data/Dataset/` (the agent sandbox mounts nothing)
 2. **Loads** task metadata (task.yaml, weights.json) at module import time
-3. **Copies** test files and data files to `/app/` in sandbox at runtime
-4. **Executes** pytest tests when `submit_solution` is called
+3. **Copies** only the task inputs (never `tests/` or the reference files) into the sandbox at setup
+4. **Copies** the test suite into a temporary sandbox dir when `submit_solution` is called, runs pytest, and deletes it
 
 ## File Access Pattern
 
@@ -109,9 +109,8 @@ The SETA environment:
 task_yaml = Path("/orwd_data/seta/Dataset/{task_id}/task.yaml")
 weights_json = Path("/orwd_data/seta/Dataset/{task_id}/weights.json")
 
-# In sandbox at runtime:
-cp /orwd_data/seta/Dataset/{task_id}/tests/test_outputs.py /app/tests/
-cp /orwd_data/seta/Dataset/{task_id}/data_file.csv /app/
+# Into the sandbox at submit time only (then removed):
+#   Dataset/{task_id}/tests/test_outputs.py -> /tmp/.grader-<random>/tests/
 ```
 
 ## Troubleshooting
