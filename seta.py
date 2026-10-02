@@ -53,6 +53,30 @@ GRADER_PYTHON = "/usr/bin/python3.12"
 # request bodies over ~4 MiB.
 UPLOAD_CHUNK_CHARS = 1 << 20
 GRADER_PYTEST_INI = b"[pytest]\n"
+# Wall-clock limit for one pytest run of the graded suite. The upstream dataset
+# budgets at most 300 s per task for its tests on a full CPU; the agent sandbox
+# has a smaller CPU share, so the grader allows three times that. Within this
+# budget a timeout comes from the submission (a hung process or loop the tests
+# wait on), so it is scored 0 like a failing suite, not raised as a grader fault.
+GRADER_TIMEOUT_S = 900
+
+# /tmp in the sandbox is memory-backed: files written there count against the
+# sandbox memory limit, while the rest of the filesystem does not. Tasks whose
+# work or tests put hundreds of MB in /tmp get a larger sandbox than the default.
+DEFAULT_MACHINE_SIZE = "0.5:1"
+MACHINE_SIZE_OVERRIDES = {
+    # Setup writes a 400 MB file to /tmp, and the task's rsync script copies it to
+    # another dir in /tmp.
+    26: "1:4",
+    # The tests write a 1 GiB image to /tmp.
+    83: "1:4",
+    # Setup writes 1.3 GB of files to /tmp.
+    274: "1:4",
+    # Setup builds a 500 MB disk image from partition images staged in /tmp, the
+    # tests extract its root partition to /tmp, and the resize work (partition
+    # copies, backups of the image) is usually done in /tmp too.
+    1106: "1:4",
+}
 
 
 def load_task_images() -> dict[str, str]:
@@ -261,7 +285,7 @@ class SETAEnv(Environment):
         self.sandbox_settings = SandboxSettings(
             environment="Eigent/SETA",
             image=image,
-            machine_size="0.5:1",
+            machine_size=MACHINE_SIZE_OVERRIDES.get(self.task_id, DEFAULT_MACHINE_SIZE),
             block_network=False,
         )
 
@@ -372,19 +396,25 @@ class SETAEnv(Environment):
         # produces a report (pytest-json-report records failures/collection errors)
         # and gets a real low score below. When the sandbox answers but the suite
         # cannot run at all (no report, e.g. the solution broke the interpreter), the
-        # attempt is scored 0.
-        report = await self._run_tests_with_retry()
+        # attempt is scored 0, as is a suite that does not finish within GRADER_TIMEOUT_S.
+        report, timed_out = await self._run_tests_with_retry()
         self.submitted += 1
 
         if report is None:
+            if timed_out:
+                text = (f"The test suite did not finish within {GRADER_TIMEOUT_S} s; "
+                        "this submission is scored 0.")
+            else:
+                text = "The test suite could not run in the sandbox; this submission is scored 0."
             return ToolOutput(
-                blocks=[TextBlock(text="The test suite could not run in the sandbox; this submission is scored 0.")],
+                blocks=[TextBlock(text=text)],
                 metadata={
                     "task_id": self.task_id,
                     "score": 0.0,
                     "passed_count": 0,
                     "test_count": len(weights),
                     "tests_ran": False,
+                    "timed_out": timed_out,
                 },
                 reward=0.0,
                 finished=True,
@@ -479,9 +509,10 @@ Final Score: {total_score:.2%}
         )
         return result.return_code == 0
 
-    async def _run_tests_once(self) -> Optional[dict]:
-        """One grading pass. Returns the pytest JSON report, or None if the suite
-        could not produce one."""
+    async def _run_tests_once(self) -> tuple[Optional[dict], bool]:
+        """One grading pass. Returns (report, timed_out): the pytest JSON report, or
+        None if the suite could not produce one, and whether pytest hit
+        GRADER_TIMEOUT_S."""
         # A fresh, unguessable dir per pass: the agent cannot pre-place files in it,
         # and it is removed as soon as the report is read.
         grader_dir = f"/tmp/.grader-{secrets_lib.token_hex(8)}"
@@ -500,31 +531,36 @@ Final Score: {total_score:.2%}
         }
         try:
             if not await self._upload_files(grader_files, grader_dir):
-                return None
+                return None, False
             if data_files and not await self._upload_files(data_files, "/app"):
-                return None
-            await self.sandbox.run(
+                return None, False
+            pytest_run = await self.sandbox.run(
                 f"mkdir -p /app && cd /app && {GRADER_PYTHON} -P -m pytest "
                 f"{grader_dir}/{TESTS_SUBDIR}/test_outputs.py -rA "
-                f"--json-report --json-report-file={report_path}"
+                f"--json-report --json-report-file={report_path}",
+                timeout=GRADER_TIMEOUT_S,
             )
+            if pytest_run.timed_out:
+                return None, True
             if (await self.sandbox.run(f"test -f {report_path}")).return_code != 0:
-                return None
+                return None, False
             report_content = await self.sandbox.download(report_path)
         finally:
             # Best effort: a lost sandbox already fails the pass with its own error.
             with contextlib.suppress(Exception):
                 await self.sandbox.run(f"rm -rf {grader_dir}")
         try:
-            return json.loads(report_content)
+            return json.loads(report_content), False
         except ValueError:
-            return None
+            return None, False
 
-    async def _run_tests_with_retry(self, *, max_attempts: int = 3) -> Optional[dict]:
-        """Run the pytest suite in the sandbox and return the parsed JSON report.
+    async def _run_tests_with_retry(self, *, max_attempts: int = 3) -> tuple[Optional[dict], bool]:
+        """Run the pytest suite in the sandbox and return (report, timed_out) as
+        _run_tests_once does.
 
-        Returns None when the sandbox answers but the suite produces no readable
-        report (scored 0 by the caller). Sandbox/transport failures are retried;
+        The report is None when the sandbox answers but the suite produces no
+        readable report or times out (scored 0 by the caller); neither is
+        retried. Sandbox/transport failures are retried;
         after ``max_attempts`` the last exception is re-raised so the tool fails
         loudly (the SDK turns it into ToolFailed -> terminal) instead of
         fabricating a score for a grader outage.
