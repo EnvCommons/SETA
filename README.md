@@ -17,6 +17,8 @@ SETA (Scaling Environments for Terminal Agents) is an ORS environment for evalua
 
 Agents are given a sandboxed environment with CLI tools (bash, read, write, edit, grep, glob, ls). Uses custom Docker image with Ubuntu 24.04.
 
+The sandbox has 0.5 CPU and 1 GB of memory. `/tmp` is memory-backed, so a few tasks whose setup or tests put hundreds of MB in `/tmp` get 1 CPU and 4 GB (`MACHINE_SIZE_OVERRIDES` in `seta.py`).
+
 ## License
 
 [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).

@@ -35,7 +35,7 @@ class FakeSandbox(AsyncSandboxesAPI):
     """In-memory sandbox. Only ``run`` is faked: ``check_run``/``download`` are the
     SDK's own implementations, so they fail the same way on a non-zero exit."""
 
-    def __init__(self, *, pytest_writes_report=True, raise_on=None):
+    def __init__(self, *, pytest_writes_report=True, raise_on=None, pytest_seconds=0):
         self.files: dict[str, bytes] = {}
         # Last content written to each path, including paths deleted since.
         self.ever_written: dict[str, bytes] = {}
@@ -43,6 +43,9 @@ class FakeSandbox(AsyncSandboxesAPI):
         self.files_at_pytest: list[set[str]] = []
         self.pytest_writes_report = pytest_writes_report
         self.raise_on = raise_on
+        # Wall-clock seconds the pytest run takes. Past the run's timeout the
+        # sandbox kills it and answers rc 124, which the SDK flags as timed_out.
+        self.pytest_seconds = pytest_seconds
         self.report = {"tests": [
             {"nodeid": "tests/test_outputs.py::test_output_file_exists", "outcome": "passed"},
             {"nodeid": "tests/test_outputs.py::test_output_contents", "outcome": "failed"},
@@ -90,6 +93,8 @@ class FakeSandbox(AsyncSandboxesAPI):
         elif "--json-report-file=" in cmd:
             self.files_at_pytest.append(set(self.files))
             report_path = re.search(r"--json-report-file=(\S+)", cmd)[1]
+            if timeout is not None and self.pytest_seconds > timeout:
+                return RunResult(output="", return_code=124, timed_out=True)
             if self.pytest_writes_report:
                 self._write(report_path, json.dumps(self.report).encode())
             else:
@@ -139,6 +144,13 @@ def make_env(sandbox):
     env = SETAEnv(task_spec={"task_id": TASK_ID}, secrets={"api_key": "test-key"})
     env.sandbox = sandbox
     return env
+
+
+def test_memory_heavy_tasks_get_a_larger_sandbox(task_dir):
+    assert make_env(FakeSandbox()).sandbox_settings.machine_size == "0.5:1"
+    big = SETAEnv(task_spec={"task_id": 1106}, secrets={"api_key": "test-key"})
+    assert big.sandbox_settings.machine_size == "1:4"
+    assert set(seta.MACHINE_SIZE_OVERRIDES) <= set(seta.TASKS)
 
 
 def test_agent_sandbox_does_not_mount_task_data(task_dir):
@@ -195,12 +207,36 @@ async def test_suite_that_cannot_run_scores_zero_without_raising(task_dir):
     result = await env.submit_solution(EmptyInput())
 
     assert result.reward == 0.0 and result.finished
-    assert result.metadata["tests_ran"] is False
+    assert result.metadata["tests_ran"] is False and result.metadata["timed_out"] is False
     assert "No module named pytest" not in result.blocks[0].text
     assert sum("--json-report-file=" in c for c in sandbox.commands) == 1
 
     repeat = await env.submit_solution(EmptyInput())
     assert repeat.reward == seta.REPEAT_SUBMISSION_PENALTY
+
+
+@run_async
+async def test_suite_slower_than_sdk_default_timeout_is_graded(task_dir):
+    env = make_env(FakeSandbox(pytest_seconds=400))
+
+    result = await env.submit_solution(EmptyInput())
+
+    assert result.metadata["tests_ran"] is True
+    assert result.reward == pytest.approx(0.4)
+
+
+@run_async
+async def test_suite_timeout_scores_zero_and_says_so(task_dir):
+    sandbox = FakeSandbox(pytest_seconds=seta.GRADER_TIMEOUT_S + 1)
+    env = make_env(sandbox)
+
+    result = await env.submit_solution(EmptyInput())
+
+    assert result.reward == 0.0 and result.finished
+    assert result.metadata["tests_ran"] is False and result.metadata["timed_out"] is True
+    assert f"did not finish within {seta.GRADER_TIMEOUT_S} s" in result.blocks[0].text
+    assert sum("--json-report-file=" in c for c in sandbox.commands) == 1
+    assert not [p for p in sandbox.files if p.startswith("/tmp/.grader-")]
 
 
 @run_async
