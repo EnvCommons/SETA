@@ -24,7 +24,6 @@ SETA_BASE_IMAGE = (
     "generalreasoning/seta-base"
     "@sha256:369515ae30815448a3b2e0189c5ef3df40786edc2a611f6bb1d3bc6b5636c363"
 )
-PER_TASK_IMAGE_PREFIX = "generalreasoning/eigent-seta"
 
 # Per-task data on the env server: DATASET_DIR/<task_id>/ holds the task inputs
 # next to the grader files (tests/, solution.sh, ...). The agent sandbox does not
@@ -44,6 +43,10 @@ REFERENCE_FILES = frozenset({
 })
 # Sandbox dir where Dockerfile COPY sources are staged during setup; removed after.
 SETUP_STAGING_DIR = "/tmp/seta-task-files"
+# Wall-clock limit for the task's setup script. Some setups install large package
+# sets (a desktop environment, toolchains) and take several minutes on the
+# sandbox's CPU share; a setup cut off by the limit leaves the task half built.
+SETUP_TIMEOUT_S = 900
 # The base image installs pytest and pytest-json-report for python3.12 only, and
 # some tasks repoint /usr/bin/python3 (the pytest script's shebang), so the
 # grader names its interpreter explicitly. -P keeps the cwd off sys.path, as
@@ -79,20 +82,6 @@ MACHINE_SIZE_OVERRIDES = {
 }
 
 
-def load_task_images() -> dict[str, str]:
-    """Load task_images.json: {task_id_str: task_image_digest}.
-
-    Returns an empty dict if the file is missing. Tasks without an entry
-    fall back to the seta-base image + runtime dockerfile_to_bash setup.
-    """
-    path = ENV_PATH / "task_images.json"
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        raw = json.load(f)
-    return {str(k): v["task_image_digest"] for k, v in raw.items() if v.get("task_image_digest")}
-
-
 def load_tasks() -> dict[int, dict]:
     """
     Load all SETA tasks from pre-built task_index.json.
@@ -118,7 +107,11 @@ def load_tasks() -> dict[int, dict]:
 
 # Load tasks at module import time
 TASKS = load_tasks()
-TASK_IMAGES = load_task_images()
+
+# Tasks whose docker-compose.yaml runs services beside the agent's container (SSH
+# servers, a database, a worker). A session gets one sandbox, so those services
+# do not exist and the task cannot be done; list_tasks leaves them out.
+MULTI_CONTAINER_TASKS = frozenset({890, 892, 973, 1133, 1198})
 
 
 def dockerfile_to_bash(dockerfile_content: str, task_id: int) -> str:
@@ -242,6 +235,7 @@ class SETAEnv(Environment):
                 "tags": task["tags"],
             }
             for task in TASKS.values()
+            if task["task_id"] not in MULTI_CONTAINER_TASKS
         ]
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
@@ -271,20 +265,9 @@ class SETAEnv(Environment):
         if not secrets.get("api_key"):
             raise ValueError("OpenReward API key required in secrets")
 
-        # Prefer the per-task image when available (built by
-        # scripts/build_task_images.py and recorded in task_images.json).
-        # Falls back to seta-base + runtime dockerfile_to_bash setup when
-        # no entry exists, so newly-added tasks keep working until they
-        # have been built.
-        self._task_image_digest: Optional[str] = TASK_IMAGES.get(str(self.task_id))
-        if self._task_image_digest is not None:
-            image = f"{PER_TASK_IMAGE_PREFIX}@{self._task_image_digest}"
-        else:
-            image = SETA_BASE_IMAGE
-
         self.sandbox_settings = SandboxSettings(
             environment="Eigent/SETA",
-            image=image,
+            image=SETA_BASE_IMAGE,
             machine_size=MACHINE_SIZE_OVERRIDES.get(self.task_id, DEFAULT_MACHINE_SIZE),
             block_network=False,
         )
@@ -296,19 +279,10 @@ class SETAEnv(Environment):
         """
         Start sandbox and execute task-specific Dockerfile setup.
 
-        When the task has a pre-built image (image_sha.txt resolved at init),
-        the image already contains the Dockerfile's installs and nothing
-        more is needed. Otherwise, fall back to converting the Dockerfile
-        to a bash script and executing it inside a seta-base sandbox.
+        The task's Dockerfile is converted to a bash script and executed inside
+        a seta-base sandbox.
         """
         await self.sandbox.start()
-
-        if self._task_image_digest is not None:
-            print(
-                f"[SETUP SUCCESS] Task {self.task_id} on pre-built image "
-                f"@{self._task_image_digest[:19]}..."
-            )
-            return
 
         try:
             # Read the Dockerfile from the env server's copy of the task data
@@ -328,7 +302,14 @@ class SETAEnv(Environment):
 
             # Execute the script
             #print(f"[SETUP] Executing setup script...")
-            output, exit_code = await self.sandbox.run("bash /tmp/setup.sh")
+            # The sandbox closes the command's output pipe once the output passes
+            # the run's byte cap, after which every write to stdout or stderr
+            # fails, so a chain like `dd ... && dd ...` stops after the first
+            # command that prints. A long setup (apt-get output) passes the cap,
+            # so its output goes to /dev/null.
+            output, exit_code = await self.sandbox.run(
+                "bash /tmp/setup.sh > /dev/null 2>&1", timeout=SETUP_TIMEOUT_S
+            )
 
             # Print output
             #print(f"[SETUP OUTPUT]\n{output}")

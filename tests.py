@@ -40,6 +40,7 @@ class FakeSandbox(AsyncSandboxesAPI):
         # Last content written to each path, including paths deleted since.
         self.ever_written: dict[str, bytes] = {}
         self.commands: list[str] = []
+        self.timeouts: dict[str, float | None] = {}
         self.files_at_pytest: list[set[str]] = []
         self.pytest_writes_report = pytest_writes_report
         self.raise_on = raise_on
@@ -74,6 +75,7 @@ class FakeSandbox(AsyncSandboxesAPI):
 
     async def run(self, cmd, timeout=300, max_bytes=50_000, sanitise=True):
         self.commands.append(cmd)
+        self.timeouts[cmd] = timeout
         await _yield_to_loop(0)
         if self.raise_on and self.raise_on in cmd:
             raise RuntimeError("sandbox connection lost")
@@ -132,7 +134,6 @@ def task_dir(tmp_path, monkeypatch):
         "task_id": TASK_ID, "instruction": "Do the thing.", "difficulty": "easy",
         "category": "software-engineering", "tags": [], "weights": WEIGHTS,
     })
-    monkeypatch.setattr(seta, "TASK_IMAGES", {})
 
     async def no_sleep(_):
         pass
@@ -151,6 +152,22 @@ def test_memory_heavy_tasks_get_a_larger_sandbox(task_dir):
     big = SETAEnv(task_spec={"task_id": 1106}, secrets={"api_key": "test-key"})
     assert big.sandbox_settings.machine_size == "1:4"
     assert set(seta.MACHINE_SIZE_OVERRIDES) <= set(seta.TASKS)
+
+
+def test_every_task_uses_the_base_image():
+    # The base image carries the grader's pytest; the task's own setup runs on it.
+    for task_id in (0, 126, 274, 1106):
+        env = SETAEnv(task_spec={"task_id": task_id}, secrets={"api_key": "test-key"})
+        assert env.sandbox_settings.image == seta.SETA_BASE_IMAGE
+
+
+def test_multi_container_tasks_are_not_listed():
+    listed = [t["task_id"] for t in SETAEnv.list_tasks("train")]
+    assert set(listed) == set(seta.TASKS) - {890, 892, 973, 1133, 1198}
+    assert len(listed) == len(seta.TASKS) - 5
+    # Remaining tasks keep their ids, and their order is stable.
+    assert listed == [t for t in seta.TASKS if t not in seta.MULTI_CONTAINER_TASKS]
+    assert 274 in listed
 
 
 def test_agent_sandbox_does_not_mount_task_data(task_dir):
@@ -173,7 +190,10 @@ async def test_setup_stages_task_inputs_but_no_reference_files(task_dir):
     assert "/tmp/seta-task-files/users.csv" in sandbox.ever_written
     assert "/tmp/seta-task-files/config/app.conf" in sandbox.ever_written
     assert b"cp -r /tmp/seta-task-files/users.csv /app/users.csv" in sandbox.ever_written["/tmp/setup.sh"]
-    assert "bash /tmp/setup.sh" in sandbox.commands
+    # Setup output never reaches the run's capped output pipe: once the pipe is
+    # closed, any setup command that prints is killed and its && chain stops.
+    assert "bash /tmp/setup.sh > /dev/null 2>&1" in sandbox.commands
+    assert sandbox.timeouts["bash /tmp/setup.sh > /dev/null 2>&1"] == seta.SETUP_TIMEOUT_S >= 600
     for path in sandbox.ever_written:
         assert not path.endswith(REFERENCE_NAMES), path
     # Staged inputs and the setup script are gone before the agent starts.
