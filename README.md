@@ -27,7 +27,7 @@ The sandbox has 0.5 CPU and 1 GB of memory. `/tmp` is memory-backed, so a few ta
 
 There is one split in this environment:
 
-- **train**: 1376 tasks
+- **train**: 1371 tasks. The 5 upstream tasks that need more than one container (890, 892, 973, 1133, 1198) are not listed, since a session runs in a single sandbox.
 
 Tasks span software engineering, system administration, DevOps, security, networking, debugging, and configuration categories.
 
